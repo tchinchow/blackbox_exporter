@@ -4,11 +4,16 @@
 {
   "name": "Blackbox Exporter Dev",
 
-  // Official Microsoft Go devcontainer image – ships with Go, git, make, curl
-  // and a non-root "vscode" user pre-configured for VS Code Server.
+  // Dockerfile extends the official Microsoft Go devcontainer image – ships
+  // with Go, git, make, curl and a non-root "vscode" user pre-configured for
+  // VS Code Server. The Dockerfile pre-creates the Go cache directories so that
+  // the named volumes below are initialised with vscode ownership instead of
+  // root (Docker creates missing mount-point parents as root by default).
   // ⚠ Do NOT reuse the project's own Dockerfiles: they set a binary ENTRYPOINT
   //   and have no shell, which makes them unsuitable as a dev base image.
-  "image": "mcr.microsoft.com/devcontainers/go:1.26-bookworm",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
 
   // ── Dev Container Features ────────────────────────────────────────────────
   "features": {
