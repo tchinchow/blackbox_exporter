@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -484,6 +485,31 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 
 	client.Transport = tt
 
+	// For mTLS enforcement probes, capture the server TLS state via VerifyConnection.
+	// VerifyConnection fires after the server cert is received/verified but before the
+	// client sends its own cert — the only point a populated ConnectionState is available
+	// on connections that will ultimately fail with a certificate_required alert.
+	var capturedTLSState atomic.Pointer[tls.ConnectionState]
+	if len(httpConfig.ValidTLSAlertCodes) > 0 {
+		if httpTransport, ok := tt.Transport.(*http.Transport); ok {
+			tlsCfg := httpTransport.TLSClientConfig
+			if tlsCfg == nil {
+				tlsCfg = &tls.Config{}
+			} else {
+				tlsCfg = tlsCfg.Clone()
+			}
+			origVerify := tlsCfg.VerifyConnection
+			tlsCfg.VerifyConnection = func(cs tls.ConnectionState) error {
+				capturedTLSState.Store(&cs)
+				if origVerify != nil {
+					return origVerify(cs)
+				}
+				return nil
+			}
+			httpTransport.TLSClientConfig = tlsCfg
+		}
+	}
+
 	client.CheckRedirect = func(r *http.Request, via []*http.Request) error {
 		logger.Info("Received redirect", "location", r.Response.Header.Get("Location"))
 		redirects = len(via)
@@ -585,6 +611,15 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 					probeTLSAlertCodeGauge.Set(float64(alertCode))
 					if slices.Contains(httpConfig.ValidTLSAlertCodes, uint8(alertCode)) {
 						logger.Debug("TLS handshake rejected with expected alert", "alert_code", uint8(alertCode))
+						if state := capturedTLSState.Load(); state != nil && len(state.PeerCertificates) > 0 {
+							isSSLGauge.Set(1)
+							registry.MustRegister(probeSSLEarliestCertExpiryGauge, probeTLSVersion, probeTLSCipher, probeSSLLastChainExpiryTimestampSeconds, probeSSLLastInformation)
+							probeSSLEarliestCertExpiryGauge.Set(float64(getEarliestCertExpiry(state).Unix()))
+							probeTLSVersion.WithLabelValues(getTLSVersion(state)).Set(1)
+							probeTLSCipher.WithLabelValues(getTLSCipher(state)).Set(1)
+							probeSSLLastChainExpiryTimestampSeconds.Set(float64(getLastChainExpiry(state).Unix()))
+							probeSSLLastInformation.WithLabelValues(getFingerprint(state), getSubject(state), getIssuer(state), getDNSNames(state), getSerialNumber(state)).Set(1)
+						}
 						success = true
 						return
 					}
