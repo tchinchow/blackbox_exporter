@@ -1,0 +1,160 @@
+// Devcontainer for github.com/prometheus/blackbox_exporter
+// Go version mirrors .promu.yml and the CI golang-builder image.
+// See .devcontainer/README.md for tool descriptions and references.
+{
+  "name": "Blackbox Exporter Dev",
+
+  // Dockerfile extends the official Microsoft Go devcontainer image – ships
+  // with Go, git, make, curl and a non-root "vscode" user pre-configured for
+  // VS Code Server. The Dockerfile pre-creates the Go cache directories so that
+  // the named volumes below are initialised with vscode ownership instead of
+  // root (Docker creates missing mount-point parents as root by default).
+  // ⚠ Do NOT reuse the project's own Dockerfiles: they set a binary ENTRYPOINT
+  //   and have no shell, which makes them unsuitable as a dev base image.
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  // ── Dev Container Features ────────────────────────────────────────────────
+  "features": {
+    // Lets "make docker" and the docker-compose commands work inside the
+    // container without needing the host Docker socket.
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": true,
+      "dockerDashComposeVersion": "v2"
+    },
+    // GitHub CLI – useful for opening PRs against upstream once your patch
+    // is ready.
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  // ── Run-time arguments ────────────────────────────────────────────────────
+  // CAP_NET_RAW  → required to send/receive ICMP packets in prober tests.
+  // SYS_PTRACE   → required by the Delve debugger (dlv).
+  // seccomp=unconfined → removes the seccomp filter so Delve can use ptrace.
+  "runArgs": [
+    "--cap-add=NET_RAW",
+    "--cap-add=SYS_PTRACE",
+    "--security-opt", "seccomp=unconfined"
+  ],
+
+  // ── Volume mounts ─────────────────────────────────────────────────────────
+  // Persist Go module cache and build cache across container rebuilds so that
+  // repeated "go build" / "go test" runs stay fast.
+  "mounts": [
+    "source=blackbox-gomodcache,target=/home/vscode/go/pkg/mod,type=volume",
+    "source=blackbox-gobuildcache,target=/home/vscode/.cache/go-build,type=volume"
+  ],
+
+  // ── Port forwarding ───────────────────────────────────────────────────────
+  // 9115 is the default listen port of blackbox_exporter.
+  "forwardPorts": [9115],
+  "portsAttributes": {
+    "9115": {
+      "label": "Blackbox Exporter",
+      "onAutoForward": "notify"
+    }
+  },
+
+  // ── VS Code customisations ────────────────────────────────────────────────
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        // ── Go ──────────────────────────────────────────────────────────────
+        // Official Go extension: gopls language server, Delve debugger, test
+        // runner, code actions, gofmt / golangci-lint integration.
+        "golang.go",
+
+        // ── AI coding assistant ──────────────────────────────────────────
+        // Inline completions and multi-line suggestions while typing.
+        "github.copilot",
+        // Chat interface: ask questions, explain code, request refactors.
+        "github.copilot-chat",
+
+        // ── Prometheus / observability ────────────────────────────────────
+        // Syntax highlighting and schema validation for PromQL / Prometheus
+        // rule files.
+        "prometheus-community.vscode-promql",
+        // Grafana-flavoured YAML / JSON dashboard and alerting rule support.
+        "grafana.vscode-jsonnet",
+
+        // ── File-type support ─────────────────────────────────────────────
+        // Schema validation and auto-complete for the project's YAML config
+        // files (blackbox.yml, example.yml, CI workflows …).
+        "redhat.vscode-yaml",
+        // Lint Markdown files (CHANGELOG.md, README.md, CONFIGURATION.md …).
+        "davidanson.vscode-markdownlint",
+        // Spell-check identifiers, comments and doc strings.
+        "streetsidesoftware.code-spell-checker",
+
+        // ── Docker / containers ───────────────────────────────────────────
+        // Manage images and containers; browse the Dockerfile whilst editing.
+        "ms-azuretools.vscode-docker",
+
+        // ── Git ───────────────────────────────────────────────────────────
+        // Inline blame, rich history exploration, PR review inside the editor.
+        "eamodio.gitlens",
+        // Visual branch / commit graph.
+        "mhutchie.git-graph"
+      ],
+
+      "settings": {
+        // ── Go extension settings ────────────────────────────────────────
+        "go.useLanguageServer": true,
+        // Prevent the extension from silently downloading a newer gopls;
+        // tooling versions are managed in post-create.sh instead.
+        "go.toolsManagement.checkForUpdates": "local",
+        // Use golangci-lint (installed by post-create.sh) instead of the
+        // simpler go vet / staticcheck wrappers.
+        "go.lintTool": "golangci-lint",
+        // --fast skips slow linters on every keystroke; the full run is
+        // still available via "make lint".
+        "go.lintFlags": ["--fast"],
+        "go.testFlags": ["-v", "-count=1"],
+
+        // ── Editor defaults for Go files ──────────────────────────────────
+        "[go]": {
+          "editor.formatOnSave": true,
+          "editor.defaultFormatter": "golang.go",
+          "editor.codeActionsOnSave": {
+            // Mirrors what "make style" checks: keep imports organised.
+            "source.organizeImports": "explicit"
+          }
+        },
+
+        // ── gopls fine-tuning ─────────────────────────────────────────────
+        "gopls": {
+          "ui.semanticTokens": true,
+          "ui.diagnostic.staticcheck": true
+        },
+
+        // ── YAML ─────────────────────────────────────────────────────────
+        "yaml.validate": true,
+        "yaml.format.enable": true,
+
+        // ── Spell-checker ─────────────────────────────────────────────────
+        "cSpell.words": [
+          "blackbox",
+          "exporter",
+          "prometheus",
+          "promu",
+          "grafana",
+          "promql",
+          "govulncheck",
+          "golangci",
+          "yamllint",
+          "icmp",
+          "quic",
+          "brotli",
+          "distroless"
+        ]
+      }
+    }
+  },
+
+  // ── Post-create setup ─────────────────────────────────────────────────────
+  // Installs project-specific CLI tools and pre-warms the module cache.
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "remoteUser": "vscode"
+}
