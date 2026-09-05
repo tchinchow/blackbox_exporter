@@ -80,11 +80,22 @@ func dialTCP(ctx context.Context, target string, module config.Module, registry 
 		// via tlsConfig to enable hostname verification.
 		tlsConfig.ServerName = targetAddress
 	}
-	timeoutDeadline, _ := ctx.Deadline()
-	dialer.Deadline = timeoutDeadline
 
 	logger.Debug("Dialing TCP with TLS")
-	return tls.DialWithDialer(dialer, dialProtocol, dialTarget, tlsConfig)
+	// Dial and handshake explicitly (rather than tls.DialWithDialer) so callers
+	// can, if needed, attempt a post-handshake Read on the returned *tls.Conn:
+	// see the comment on the post-handshake read in ProbeTCP for why that's
+	// required to observe a TLS 1.3 server's rejection alert.
+	rawConn, err := dialer.DialContext(ctx, dialProtocol, dialTarget)
+	if err != nil {
+		return nil, err
+	}
+	tlsConn := tls.Client(rawConn, tlsConfig)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		tlsConn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
 }
 
 func ProbeTCP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger *slog.Logger) bool {
@@ -114,6 +125,34 @@ func ProbeTCP(ctx context.Context, target string, module config.Module, registry
 	defer conn.Close()
 
 	if checkTLSAlert {
+		// A TLS 1.3 client considers its handshake complete as soon as it sends
+		// its own Finished message, without waiting for the server's reaction.
+		// If the server is rejecting the connection (e.g. certificate_required,
+		// bad_certificate), that alert is only delivered as the next record on
+		// the wire, so it surfaces on the first Read, not on Handshake itself.
+		// Attempt that Read here so the alert can still be observed; TLS 1.2
+		// always resolves this synchronously during dialTCP and won't reach
+		// this point with unread data.
+		if tlsConn, ok := conn.(*tls.Conn); ok {
+			deadline, _ := ctx.Deadline()
+			if err := tlsConn.SetReadDeadline(deadline); err != nil {
+				logger.Error("Error setting read deadline", "err", err)
+				return false
+			}
+			if _, readErr := tlsConn.Read(make([]byte, 1)); readErr != nil {
+				if alertCode, ok := extractTLSAlertCode(readErr); ok {
+					probeTLSAlertCode.Set(float64(alertCode))
+					if slices.Contains(module.TCP.ValidTLSAlertCodes, uint8(alertCode)) {
+						logger.Debug("TLS handshake rejected with expected alert (observed post-handshake)", "alert_code", uint8(alertCode))
+						return true
+					}
+					logger.Error("TLS handshake rejected with unexpected alert (observed post-handshake)", "alert_code", uint8(alertCode), "valid_codes", module.TCP.ValidTLSAlertCodes)
+					return false
+				}
+				logger.Error("Error reading from TLS connection while checking for a rejection alert", "err", readErr)
+				return false
+			}
+		}
 		logger.Error("TLS connection succeeded but valid_tls_alert_codes requires rejection")
 		return false
 	}
