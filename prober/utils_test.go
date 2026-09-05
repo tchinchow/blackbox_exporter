@@ -32,6 +32,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	pconfig "github.com/prometheus/common/config"
 	"github.com/prometheus/common/promslog"
 )
 
@@ -143,6 +144,25 @@ func generateSelfSignedCertificateWithPrivateKey(template *x509.Certificate, pri
 	publickey := &privatekey.PublicKey
 	cert, pemCert := generateCertificate(template, template, publickey, privatekey)
 	return cert, pemCert
+}
+
+// clientCertTLSConfig returns a TLS client config presenting a self-signed
+// certificate, for probes that need to reach a server's client-certificate
+// verification step (as opposed to presenting no certificate at all).
+func clientCertTLSConfig(t *testing.T) pconfig.TLSConfig {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Error creating rsa key: %s", err)
+	}
+	tmpl := generateCertificateTemplate(time.Now().Add(time.Hour), false)
+	_, certPem := generateSelfSignedCertificateWithPrivateKey(tmpl, key)
+	keyPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	return pconfig.TLSConfig{
+		InsecureSkipVerify: true,
+		Cert:               string(certPem),
+		Key:                pconfig.Secret(keyPem),
+	}
 }
 
 // crlCertOptions describes a certificate to generate for CRL tests.
