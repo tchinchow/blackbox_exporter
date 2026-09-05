@@ -258,7 +258,6 @@ func TestTCPConnectionWithExpectedTLSAlert(t *testing.T) {
 		tlsVersion uint16
 		alertCode  uint8
 	}{
-		// TODO: double check TLSv1.3 behaviour
 		{"TLS 1.3 sends certificate_required", tls.VersionTLS13, 116},
 		{"TLS 1.2 sends handshake_failure", tls.VersionTLS12, 40},
 	}
@@ -294,6 +293,137 @@ func TestTCPConnectionWithExpectedTLSAlert(t *testing.T) {
 			checkRegistryResults(expectedResults, mfs, t)
 		})
 	}
+}
+
+func TestTCPConnectionWithUnexpectedTLSAlert(t *testing.T) {
+	tests := []struct {
+		name          string
+		tlsVersion    uint16
+		observedAlert uint8
+	}{
+		{"TLS 1.3 sends certificate_required", tls.VersionTLS13, 116},
+		{"TLS 1.2 sends handshake_failure", tls.VersionTLS12, 40},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ln := tlsRequireClientCertServer(t, test.tlsVersion)
+
+			testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			module := config.Module{
+				TCP: config.TCPProbe{
+					IPProtocolFallback: true,
+					TLS:                true,
+					TLSConfig:          pconfig.TLSConfig{InsecureSkipVerify: true},
+					// Listing only an unrelated code must make the probe fail,
+					// regardless of which alert the server actually sent.
+					ValidTLSAlertCodes: []uint8{200},
+				},
+			}
+
+			registry := prometheus.NewRegistry()
+			if ProbeTCP(testCTX, ln.Addr().String(), module, registry, promslog.NewNopLogger()) {
+				t.Fatalf("TCP module succeeded, expected failure on unexpected TLS alert.")
+			}
+
+			mfs, err := registry.Gather()
+			if err != nil {
+				t.Fatal(err)
+			}
+			expectedResults := map[string]float64{
+				"probe_tls_alert_code": float64(test.observedAlert),
+			}
+			checkRegistryResults(expectedResults, mfs, t)
+		})
+	}
+}
+
+func TestTCPConnectionSucceedsWithTLSAlertCodesConfiguredFails(t *testing.T) {
+	certExpiry := time.Now().AddDate(0, 0, 1)
+	tmpl := generateCertificateTemplate(certExpiry, true)
+	tmpl.IsCA = true
+	_, certPem, key := generateSelfSignedCertificate(tmpl)
+	keyPem := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	serverCert, err := tls.X509KeyPair(certPem, keyPem)
+	if err != nil {
+		t.Fatalf("Failed to decode TLS testing keypair: %s", err)
+	}
+
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error listening on socket: %s", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{serverCert}})
+		defer tlsConn.Close()
+		// This handshake genuinely succeeds; the probe must still fail because
+		// valid_tls_alert_codes means a rejection is expected.
+		tlsConn.Handshake()
+	}()
+
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	module := config.Module{
+		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
+			TLS:                true,
+			TLSConfig:          pconfig.TLSConfig{InsecureSkipVerify: true},
+			ValidTLSAlertCodes: []uint8{116},
+		},
+	}
+
+	registry := prometheus.NewRegistry()
+	if ProbeTCP(testCTX, ln.Addr().String(), module, registry, promslog.NewNopLogger()) {
+		t.Fatalf("TCP module succeeded, expected failure because valid_tls_alert_codes requires rejection.")
+	}
+}
+
+func TestTCPConnectionNonAlertFailureWithTLSAlertCodesConfigured(t *testing.T) {
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error listening on socket: %s", err)
+	}
+	addr := ln.Addr().String()
+	// Nothing listens on addr anymore, so dialing it fails at the TCP level
+	// (connection refused) before any TLS handshake can occur.
+	ln.Close()
+
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	module := config.Module{
+		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
+			TLS:                true,
+			TLSConfig:          pconfig.TLSConfig{InsecureSkipVerify: true},
+			ValidTLSAlertCodes: []uint8{116},
+		},
+	}
+
+	registry := prometheus.NewRegistry()
+	if ProbeTCP(testCTX, addr, module, registry, promslog.NewNopLogger()) {
+		t.Fatalf("TCP module succeeded, expected failure on a non-TLS connection error.")
+	}
+
+	// The dial failed before any TLS alert could be observed.
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedResults := map[string]float64{
+		"probe_tls_alert_code": 0,
+	}
+	checkRegistryResults(expectedResults, mfs, t)
 }
 
 // tlsRejectClientCertServer starts a TLS listener that requires a client
@@ -349,10 +479,6 @@ func TestTCPConnectionWithBadCertificateTLSAlert(t *testing.T) {
 		name       string
 		tlsVersion uint16
 	}{
-		// TODO: double check TLSv1.3 behaviour — same dialTCP limitation as
-		// TestTCPConnectionWithExpectedTLSAlert's TLS 1.3 case: the server's
-		// rejection alert is only surfaced on a subsequent Read, which
-		// dialTCP/ProbeTCP never attempts once tls.DialWithDialer succeeds.
 		{"TLS 1.3 sends bad_certificate", tls.VersionTLS13},
 		{"TLS 1.2 sends bad_certificate", tls.VersionTLS12},
 	}

@@ -1648,35 +1648,48 @@ func TestHTTPConnectionWithExpectedTLSAlert(t *testing.T) {
 }
 
 func TestHTTPConnectionWithUnexpectedTLSAlert(t *testing.T) {
-	ts := tlsRequireClientCertHTTPServer(t, tls.VersionTLS13)
-
-	registry := prometheus.NewRegistry()
-	module := config.Module{
-		Timeout: 10 * time.Second,
-		HTTP: config.HTTPProbe{
-			IPProtocolFallback: true,
-			// The server actually sends 116 (certificate_required); listing
-			// only an unrelated code must make the probe fail.
-			ValidTLSAlertCodes: []uint8{40},
-			HTTPClientConfig: pconfig.HTTPClientConfig{
-				TLSConfig: pconfig.TLSConfig{InsecureSkipVerify: true},
-			},
-		},
+	tests := []struct {
+		name          string
+		tlsVersion    uint16
+		observedAlert uint8
+	}{
+		{"TLS 1.3 sends certificate_required", tls.VersionTLS13, 116},
+		{"TLS 1.2 sends handshake_failure", tls.VersionTLS12, 40},
 	}
 
-	result := ProbeHTTP(context.Background(), ts.URL, module, registry, promslog.NewNopLogger())
-	if result {
-		t.Fatalf("HTTP probe succeeded, expected failure on unexpected TLS alert.")
-	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ts := tlsRequireClientCertHTTPServer(t, test.tlsVersion)
 
-	mfs, err := registry.Gather()
-	if err != nil {
-		t.Fatal(err)
+			registry := prometheus.NewRegistry()
+			module := config.Module{
+				Timeout: 10 * time.Second,
+				HTTP: config.HTTPProbe{
+					IPProtocolFallback: true,
+					// Listing only an unrelated code must make the probe
+					// fail, regardless of which alert the server actually sent.
+					ValidTLSAlertCodes: []uint8{200},
+					HTTPClientConfig: pconfig.HTTPClientConfig{
+						TLSConfig: pconfig.TLSConfig{InsecureSkipVerify: true},
+					},
+				},
+			}
+
+			result := ProbeHTTP(context.Background(), ts.URL, module, registry, promslog.NewNopLogger())
+			if result {
+				t.Fatalf("HTTP probe succeeded, expected failure on unexpected TLS alert.")
+			}
+
+			mfs, err := registry.Gather()
+			if err != nil {
+				t.Fatal(err)
+			}
+			expectedResults := map[string]float64{
+				"probe_tls_alert_code": float64(test.observedAlert),
+			}
+			checkRegistryResults(expectedResults, mfs, t)
+		})
 	}
-	expectedResults := map[string]float64{
-		"probe_tls_alert_code": 116,
-	}
-	checkRegistryResults(expectedResults, mfs, t)
 }
 
 func TestHTTPConnectionSucceedsWithTLSAlertCodesConfiguredFails(t *testing.T) {
@@ -1699,6 +1712,73 @@ func TestHTTPConnectionSucceedsWithTLSAlertCodesConfiguredFails(t *testing.T) {
 	if result {
 		t.Fatalf("HTTP probe succeeded, expected failure because valid_tls_alert_codes requires rejection.")
 	}
+}
+
+func TestHTTPConnectionPlainHTTPWithTLSAlertCodesFails(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	defer ts.Close()
+
+	registry := prometheus.NewRegistry()
+	module := config.Module{
+		Timeout: 10 * time.Second,
+		HTTP: config.HTTPProbe{
+			IPProtocolFallback: true,
+			ValidTLSAlertCodes: []uint8{116},
+		},
+	}
+
+	result := ProbeHTTP(context.Background(), ts.URL, module, registry, promslog.NewNopLogger())
+	if result {
+		t.Fatalf("HTTP probe succeeded against a plain http:// target, expected failure because valid_tls_alert_codes requires a TLS rejection.")
+	}
+
+	// No TLS handshake ever happens, so no alert can have been observed.
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedResults := map[string]float64{
+		"probe_tls_alert_code": 0,
+	}
+	checkRegistryResults(expectedResults, mfs, t)
+}
+
+func TestHTTPConnectionNonAlertFailureWithTLSAlertCodesConfigured(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Error listening on socket: %s", err)
+	}
+	addr := ln.Addr().String()
+	// Nothing listens on addr anymore, so dialing it fails at the TCP level
+	// (connection refused) before any TLS handshake can occur.
+	ln.Close()
+
+	registry := prometheus.NewRegistry()
+	module := config.Module{
+		Timeout: 10 * time.Second,
+		HTTP: config.HTTPProbe{
+			IPProtocolFallback: true,
+			ValidTLSAlertCodes: []uint8{116},
+			HTTPClientConfig: pconfig.HTTPClientConfig{
+				TLSConfig: pconfig.TLSConfig{InsecureSkipVerify: true},
+			},
+		},
+	}
+
+	result := ProbeHTTP(context.Background(), "https://"+addr, module, registry, promslog.NewNopLogger())
+	if result {
+		t.Fatalf("HTTP probe succeeded, expected failure on a non-TLS connection error.")
+	}
+
+	// The connection failed before any TLS alert could be observed.
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedResults := map[string]float64{
+		"probe_tls_alert_code": 0,
+	}
+	checkRegistryResults(expectedResults, mfs, t)
 }
 
 // tlsRejectClientCertHTTPServer starts an HTTPS server that requires a client
