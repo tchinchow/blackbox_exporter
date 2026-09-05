@@ -556,6 +556,9 @@ func (s *TCPProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	if s.CheckRevoked && !s.TLS && !usesStartTLS(s.QueryResponse) {
 		return errors.New("check_revoked cannot be used when tls is false and no query_response step uses starttls")
 	}
+	if len(s.ValidTLSAlertCodes) > 0 && !s.TLS {
+		return errors.New("valid_tls_alert_codes cannot be used when tls is false")
+	}
 	return nil
 }
 
