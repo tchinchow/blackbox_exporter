@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net"
 	"slices"
+	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
 	pconfig "github.com/prometheus/common/config"
@@ -27,19 +28,19 @@ import (
 	"github.com/prometheus/blackbox_exporter/config"
 )
 
-func dialTCP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger *slog.Logger) (net.Conn, error) {
+func dialTCP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger *slog.Logger) (net.Conn, *tls.ConnectionState, error) {
 	var dialProtocol, dialTarget string
 	dialer := &net.Dialer{}
 	targetAddress, port, err := net.SplitHostPort(target)
 	if err != nil {
 		logger.Error("Error splitting target address and port", "err", err)
-		return nil, err
+		return nil, nil, err
 	}
 
 	ip, _, err := chooseProtocol(ctx, module.TCP.IPProtocol, module.TCP.IPProtocolFallback, targetAddress, registry, logger)
 	if err != nil {
 		logger.Error("Error resolving address", "err", err)
-		return nil, err
+		return nil, nil, err
 	}
 
 	if ip.IP.To4() == nil {
@@ -52,7 +53,7 @@ func dialTCP(ctx context.Context, target string, module config.Module, registry 
 		srcIP := net.ParseIP(module.TCP.SourceIPAddress)
 		if srcIP == nil {
 			logger.Error("Error parsing source ip address", "srcIP", module.TCP.SourceIPAddress)
-			return nil, fmt.Errorf("error parsing source ip address: %s", module.TCP.SourceIPAddress)
+			return nil, nil, fmt.Errorf("error parsing source ip address: %s", module.TCP.SourceIPAddress)
 		}
 		logger.Debug("Using local address", "srcIP", srcIP)
 		dialer.LocalAddr = &net.TCPAddr{IP: srcIP}
@@ -62,12 +63,13 @@ func dialTCP(ctx context.Context, target string, module config.Module, registry 
 
 	if !module.TCP.TLS {
 		logger.Debug("Dialing TCP without TLS")
-		return dialer.DialContext(ctx, dialProtocol, dialTarget)
+		conn, err := dialer.DialContext(ctx, dialProtocol, dialTarget)
+		return conn, nil, err
 	}
 	tlsConfig, err := pconfig.NewTLSConfig(&module.TCP.TLSConfig)
 	if err != nil {
 		logger.Error("Error creating TLS configuration", "err", err)
-		return nil, err
+		return nil, nil, err
 	}
 
 	if len(tlsConfig.ServerName) == 0 {
@@ -81,6 +83,22 @@ func dialTCP(ctx context.Context, target string, module config.Module, registry 
 		tlsConfig.ServerName = targetAddress
 	}
 
+	// For mTLS enforcement probes, capture the server TLS state via VerifyConnection.
+	// VerifyConnection fires once the server cert is received/verified but before the
+	// client sends its own cert — the only point a populated ConnectionState is available
+	// on connections that will ultimately fail with a rejection alert.
+	var capturedTLSState atomic.Pointer[tls.ConnectionState]
+	if len(module.TCP.ValidTLSAlertCodes) > 0 {
+		origVerify := tlsConfig.VerifyConnection
+		tlsConfig.VerifyConnection = func(cs tls.ConnectionState) error {
+			capturedTLSState.Store(&cs)
+			if origVerify != nil {
+				return origVerify(cs)
+			}
+			return nil
+		}
+	}
+
 	logger.Debug("Dialing TCP with TLS")
 	// Dial and handshake explicitly (rather than tls.DialWithDialer) so callers
 	// can, if needed, attempt a post-handshake Read on the returned *tls.Conn:
@@ -88,14 +106,43 @@ func dialTCP(ctx context.Context, target string, module config.Module, registry 
 	// required to observe a TLS 1.3 server's rejection alert.
 	rawConn, err := dialer.DialContext(ctx, dialProtocol, dialTarget)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tlsConn := tls.Client(rawConn, tlsConfig)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		tlsConn.Close()
-		return nil, err
+		return nil, capturedTLSState.Load(), err
 	}
-	return tlsConn, nil
+	return tlsConn, capturedTLSState.Load(), nil
+}
+
+// reportCapturedTLSState publishes certificate/TLS/CRL metrics for a TLS state
+// captured before an accepted rejection alert arrived, matching what a
+// genuinely successful TLS/TCP connection reports via probeQueryResponses.
+func reportCapturedTLSState(ctx context.Context, state *tls.ConnectionState, checkRevoked bool, registry *prometheus.Registry, logger *slog.Logger) {
+	if state == nil || len(state.PeerCertificates) == 0 {
+		return
+	}
+
+	probeSSLEarliestCertExpiry := prometheus.NewGauge(sslEarliestCertExpiryGaugeOpts)
+	probeSSLLastChainExpiryTimestampSeconds := prometheus.NewGauge(sslChainExpiryInTimeStampGaugeOpts)
+	probeSSLLastInformation := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "probe_ssl_last_chain_info",
+			Help: "Contains SSL leaf certificate information",
+		},
+		[]string{"fingerprint_sha256", "subject", "issuer", "subjectalternative", "serialnumber"},
+	)
+	probeTLSVersion := prometheus.NewGaugeVec(probeTLSInfoGaugeOpts, []string{"version"})
+	probeTLSCipher := prometheus.NewGaugeVec(probeTLSCipherGaugeOpts, []string{"cipher"})
+
+	registry.MustRegister(probeSSLEarliestCertExpiry, probeTLSVersion, probeTLSCipher, probeSSLLastChainExpiryTimestampSeconds, probeSSLLastInformation)
+	probeSSLEarliestCertExpiry.Set(float64(getEarliestCertExpiry(state).Unix()))
+	probeTLSVersion.WithLabelValues(getTLSVersion(state)).Set(1)
+	probeTLSCipher.WithLabelValues(getTLSCipher(state)).Set(1)
+	probeSSLLastChainExpiryTimestampSeconds.Set(float64(getLastChainExpiry(state).Unix()))
+	probeSSLLastInformation.WithLabelValues(getFingerprint(state), getSubject(state), getIssuer(state), getDNSNames(state), getSerialNumber(state)).Set(1)
+	checkCRL(ctx, state, checkRevoked, nil, registry, logger)
 }
 
 func ProbeTCP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger *slog.Logger) bool {
@@ -106,13 +153,14 @@ func ProbeTCP(ctx context.Context, target string, module config.Module, registry
 		registry.MustRegister(probeTLSAlertCode)
 	}
 
-	conn, err := dialTCP(ctx, target, module, registry, logger)
+	conn, capturedState, err := dialTCP(ctx, target, module, registry, logger)
 	if err != nil {
 		if checkTLSAlert {
 			if alertCode, ok := extractTLSAlertCode(err); ok {
 				probeTLSAlertCode.Set(float64(alertCode))
 				if slices.Contains(module.TCP.ValidTLSAlertCodes, uint8(alertCode)) {
 					logger.Debug("TLS handshake rejected with expected alert", "alert_code", uint8(alertCode))
+					reportCapturedTLSState(ctx, capturedState, module.TCP.CheckRevoked, registry, logger)
 					return true
 				}
 				logger.Error("TLS handshake rejected with unexpected alert", "alert_code", uint8(alertCode), "valid_codes", module.TCP.ValidTLSAlertCodes)
@@ -144,6 +192,7 @@ func ProbeTCP(ctx context.Context, target string, module config.Module, registry
 					probeTLSAlertCode.Set(float64(alertCode))
 					if slices.Contains(module.TCP.ValidTLSAlertCodes, uint8(alertCode)) {
 						logger.Debug("TLS handshake rejected with expected alert (observed post-handshake)", "alert_code", uint8(alertCode))
+						reportCapturedTLSState(ctx, capturedState, module.TCP.CheckRevoked, registry, logger)
 						return true
 					}
 					logger.Error("TLS handshake rejected with unexpected alert (observed post-handshake)", "alert_code", uint8(alertCode), "valid_codes", module.TCP.ValidTLSAlertCodes)

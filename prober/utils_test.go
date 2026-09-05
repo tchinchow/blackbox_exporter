@@ -265,11 +265,20 @@ func serverTLSCert(key *rsa.PrivateKey, chain ...*x509.Certificate) tls.Certific
 // that reports the leaf as valid (not revoked). Useful for TLS servers whose
 // certificate/CRL metrics need a real, verifiable chain rather than the plain
 // self-signed certs used elsewhere.
-func newCRLLeafCert(t *testing.T) (leaf *x509.Certificate, leafKey *rsa.PrivateKey, ca *x509.Certificate) {
+func newCRLLeafCert(t *testing.T) (*x509.Certificate, *rsa.PrivateKey, *x509.Certificate) {
 	t.Helper()
-	ca, caKey := generateCRLTestCert(t, crlCertOptions{CommonName: "Test CA", Serial: 1, IsCA: true}, nil, nil)
+
+	// The CA's expiry is set far later than the leaf's so getEarliestCertExpiry
+	// (which scans the whole chain) deterministically returns the leaf's
+	// NotAfter, regardless of any millisecond-level timing between creating
+	// the two certificates straddling a whole-second boundary.
+	caTmpl := generateCertificateTemplate(time.Now().Add(30*24*time.Hour), true)
+	caTmpl.IsCA = true
+	caTmpl.KeyUsage |= x509.KeyUsageCRLSign
+	ca, _, caKey := generateSelfSignedCertificate(caTmpl)
+
 	crlServer := newCRLServer(t, createCRL(t, ca, caKey, time.Now().Add(-1*time.Hour), time.Now().Add(24*time.Hour)))
-	leaf, leafKey = generateCRLTestCert(t, crlCertOptions{CommonName: "Test Leaf", Serial: 2000, CRLURL: crlServer.URL}, ca, caKey)
+	leaf, leafKey := generateCRLTestCert(t, crlCertOptions{CommonName: "Test Leaf", Serial: 2000, CRLURL: crlServer.URL}, ca, caKey)
 	return leaf, leafKey, ca
 }
 
