@@ -1856,6 +1856,71 @@ func TestHTTPConnectionWithBadCertificateTLSAlert(t *testing.T) {
 	}
 }
 
+// TestHTTPConnectionWithExpectedTLSAlertReportsCertificateMetrics asserts that
+// on the accepted-alert path, HTTP still captures the server's certificate via
+// VerifyConnection: SSL indicator, expiry, TLS version/cipher, certificate
+// information, and CRL availability are all populated, exactly as they would
+// be for an ordinary successful TLS connection.
+func TestHTTPConnectionWithExpectedTLSAlertReportsCertificateMetrics(t *testing.T) {
+	tests := []struct {
+		name       string
+		tlsVersion uint16
+		alertCode  uint8
+	}{
+		{"TLS 1.3 sends certificate_required", tls.VersionTLS13, 116},
+		{"TLS 1.2 sends handshake_failure", tls.VersionTLS12, 40},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			leaf, leafKey, ca := newCRLLeafCert(t)
+			ts := tlsRequireClientCertHTTPServerWithCert(t, test.tlsVersion, leaf, leafKey, ca)
+
+			registry := prometheus.NewRegistry()
+			module := config.Module{
+				Timeout: 10 * time.Second,
+				HTTP: config.HTTPProbe{
+					IPProtocolFallback: true,
+					ValidTLSAlertCodes: []uint8{test.alertCode},
+					CheckRevoked:       true,
+					HTTPClientConfig: pconfig.HTTPClientConfig{
+						TLSConfig: pconfig.TLSConfig{InsecureSkipVerify: true},
+					},
+				},
+			}
+
+			result := ProbeHTTP(context.Background(), ts.URL, module, registry, promslog.NewNopLogger())
+			if !result {
+				t.Fatalf("HTTP probe failed, expected success on expected TLS alert %d.", test.alertCode)
+			}
+
+			mfs, err := registry.Gather()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			expectedResults := map[string]float64{
+				"probe_http_ssl":                 1,
+				"probe_ssl_earliest_cert_expiry": float64(leaf.NotAfter.Unix()),
+				"probe_tls_version_info":         1,
+				"probe_tls_cipher_info":          1,
+			}
+			checkRegistryResults(expectedResults, mfs, t)
+
+			leafSubject := leaf.Subject.String()
+			if val, ok := getMetricWithLabels(mfs, "probe_ssl_last_chain_info", map[string]string{"subject": leafSubject}); !ok || val != 1 {
+				t.Errorf("Expected probe_ssl_last_chain_info=1 with subject=%q, got %v (found=%v)", leafSubject, val, ok)
+			}
+			if val, ok := getMetricWithLabels(mfs, "probe_ssl_crl_available", map[string]string{"subject": leafSubject}); !ok || val != 1 {
+				t.Errorf("Expected probe_ssl_crl_available=1 with subject=%q, got %v (found=%v)", leafSubject, val, ok)
+			}
+			if val, ok := getMetricWithLabels(mfs, "probe_ssl_crl_revoked", map[string]string{"subject": leafSubject}); !ok || val != 0 {
+				t.Errorf("Expected probe_ssl_crl_revoked=0 with subject=%q, got %v (found=%v)", leafSubject, val, ok)
+			}
+		})
+	}
+}
+
 func TestHTTPCRLUnreachableReportsUnavailable(t *testing.T) {
 	// CRL responder that hangs until the probe context is cancelled,
 	// reproducing a "context deadline exceeded" during the CRL fetch.

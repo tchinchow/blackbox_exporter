@@ -516,6 +516,69 @@ func TestTCPConnectionWithBadCertificateTLSAlert(t *testing.T) {
 	}
 }
 
+// TestTCPConnectionWithExpectedTLSAlertReportsCertificateMetrics asserts that
+// the TCP prober behaves exactly like the HTTP prober on the accepted-alert
+// path: it must still capture the server's certificate and report the same
+// TLS/certificate/CRL metrics as a genuinely successful TLS/TCP connection.
+func TestTCPConnectionWithExpectedTLSAlertReportsCertificateMetrics(t *testing.T) {
+	tests := []struct {
+		name       string
+		tlsVersion uint16
+		alertCode  uint8
+	}{
+		{"TLS 1.3 sends certificate_required", tls.VersionTLS13, 116},
+		{"TLS 1.2 sends handshake_failure", tls.VersionTLS12, 40},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			leaf, leafKey, ca := newCRLLeafCert(t)
+			ln := tlsRequireClientCertServerWithCert(t, test.tlsVersion, leaf, leafKey, ca)
+
+			testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			module := config.Module{
+				TCP: config.TCPProbe{
+					IPProtocolFallback: true,
+					TLS:                true,
+					TLSConfig:          pconfig.TLSConfig{InsecureSkipVerify: true},
+					ValidTLSAlertCodes: []uint8{test.alertCode},
+					CheckRevoked:       true,
+				},
+			}
+
+			registry := prometheus.NewRegistry()
+			if !ProbeTCP(testCTX, ln.Addr().String(), module, registry, promslog.NewNopLogger()) {
+				t.Fatalf("TCP module failed, expected success on expected TLS alert %d.", test.alertCode)
+			}
+
+			mfs, err := registry.Gather()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			expectedResults := map[string]float64{
+				"probe_ssl_earliest_cert_expiry": float64(leaf.NotAfter.Unix()),
+				"probe_tls_version_info":         1,
+				"probe_tls_cipher_info":          1,
+			}
+			checkRegistryResults(expectedResults, mfs, t)
+
+			leafSubject := leaf.Subject.String()
+			if val, ok := getMetricWithLabels(mfs, "probe_ssl_last_chain_info", map[string]string{"subject": leafSubject}); !ok || val != 1 {
+				t.Errorf("Expected probe_ssl_last_chain_info=1 with subject=%q, got %v (found=%v)", leafSubject, val, ok)
+			}
+			if val, ok := getMetricWithLabels(mfs, "probe_ssl_crl_available", map[string]string{"subject": leafSubject}); !ok || val != 1 {
+				t.Errorf("Expected probe_ssl_crl_available=1 with subject=%q, got %v (found=%v)", leafSubject, val, ok)
+			}
+			if val, ok := getMetricWithLabels(mfs, "probe_ssl_crl_revoked", map[string]string{"subject": leafSubject}); !ok || val != 0 {
+				t.Errorf("Expected probe_ssl_crl_revoked=0 with subject=%q, got %v (found=%v)", leafSubject, val, ok)
+			}
+		})
+	}
+}
+
 func TestTCPConnectionWithTLSAndVerifiedCertificateChain(t *testing.T) {
 	if os.Getenv("CI") == "true" {
 		t.Skip("skipping; CI is failing on ipv6 dns requests")

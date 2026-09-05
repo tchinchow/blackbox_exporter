@@ -261,6 +261,70 @@ func serverTLSCert(key *rsa.PrivateKey, chain ...*x509.Certificate) tls.Certific
 	return tls.Certificate{Certificate: raw, PrivateKey: key}
 }
 
+// newCRLLeafCert builds a CA + leaf certificate pair with a live CRL responder
+// that reports the leaf as valid (not revoked). Useful for TLS servers whose
+// certificate/CRL metrics need a real, verifiable chain rather than the plain
+// self-signed certs used elsewhere.
+func newCRLLeafCert(t *testing.T) (leaf *x509.Certificate, leafKey *rsa.PrivateKey, ca *x509.Certificate) {
+	t.Helper()
+	ca, caKey := generateCRLTestCert(t, crlCertOptions{CommonName: "Test CA", Serial: 1, IsCA: true}, nil, nil)
+	crlServer := newCRLServer(t, createCRL(t, ca, caKey, time.Now().Add(-1*time.Hour), time.Now().Add(24*time.Hour)))
+	leaf, leafKey = generateCRLTestCert(t, crlCertOptions{CommonName: "Test Leaf", Serial: 2000, CRLURL: crlServer.URL}, ca, caKey)
+	return leaf, leafKey, ca
+}
+
+// tlsRequireClientCertServerWithCert starts a TLS listener presenting the given
+// leaf/ca chain and requiring (but not verifying) a client certificate,
+// restricted to a single TLS version. Like tlsRequireClientCertServer, the
+// probe never presents one, so the handshake is rejected with a
+// version-specific alert.
+func tlsRequireClientCertServerWithCert(t *testing.T, tlsVersion uint16, leaf *x509.Certificate, leafKey *rsa.PrivateKey, ca *x509.Certificate) net.Listener {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error listening on socket: %s", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		tlsConn := tls.Server(conn, &tls.Config{
+			Certificates: []tls.Certificate{serverTLSCert(leafKey, leaf, ca)},
+			ClientAuth:   tls.RequireAnyClientCert,
+			MinVersion:   tlsVersion,
+			MaxVersion:   tlsVersion,
+		})
+		defer tlsConn.Close()
+		// The client never presents a certificate, so this always errors;
+		// the alert it sent is what the test cares about.
+		tlsConn.Handshake()
+	}()
+
+	return ln
+}
+
+// tlsRequireClientCertHTTPServerWithCert is the HTTP counterpart of
+// tlsRequireClientCertServerWithCert.
+func tlsRequireClientCertHTTPServerWithCert(t *testing.T, tlsVersion uint16, leaf *x509.Certificate, leafKey *rsa.PrivateKey, ca *x509.Certificate) *httptest.Server {
+	t.Helper()
+
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	ts.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverTLSCert(leafKey, leaf, ca)},
+		ClientAuth:   tls.RequireAnyClientCert,
+		MinVersion:   tlsVersion,
+		MaxVersion:   tlsVersion,
+	}
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	return ts
+}
+
 // getMetricValue returns the value of the first metric in the named family.
 func getMetricValue(mfs []*dto.MetricFamily, name string) (float64, bool) {
 	for _, mf := range mfs {
