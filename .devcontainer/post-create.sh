@@ -7,14 +7,14 @@
 set -euo pipefail
 
 # ── Constants (kept in sync with Makefile.common) ────────────────────────────
-GOLANGCI_LINT_VERSION="v2.11.4"   # GOLANGCI_LINT_VERSION in Makefile.common
+GOLANGCI_LINT_VERSION="v2.13.1"   # GOLANGCI_LINT_VERSION in Makefile.common
 PROMU_VERSION="0.20.0"             # PROMU_VERSION in Makefile.common
 
 GOOS="$(go env GOOS)"
 GOARCH="$(go env GOARCH)"
 
 echo "==> [1/5] Installing golangci-lint ${GOLANGCI_LINT_VERSION}"
-curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+curl -sSfL "https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANGCI_LINT_VERSION}/install.sh" \
     | sudo sh -s -- -b /usr/local/bin "${GOLANGCI_LINT_VERSION}"
 
 echo "==> [2/5] Installing promu ${PROMU_VERSION}"

@@ -51,7 +51,7 @@ Reference: <https://containers.dev/features>
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| **golangci-lint** | v2.11.4 | Aggregated linter — `make lint`.  Version pinned to `GOLANGCI_LINT_VERSION` in `Makefile.common`. |
+| **golangci-lint** | v2.13.1 | Aggregated linter — `make lint`.  Version pinned to `GOLANGCI_LINT_VERSION` in `Makefile.common`. |
 | **promu** | 0.20.0 | Prometheus build tool — `make build`.  Injects version/branch/date ldflags into the binary.  Version pinned to `PROMU_VERSION` in `Makefile.common`. |
 | **govulncheck** | latest | Static vulnerability scanner — mirrors the `govulncheck.yml` CI workflow. |
 | **yamllint** | distro | YAML style and syntax checker — `make yamllint`. |
